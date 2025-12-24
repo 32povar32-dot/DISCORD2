@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>P2P Voice Chat</title>
+</head>
+<body>
+  <h1>P2P Голосовой чат</h1>
+  <input id="room" placeholder="Название комнаты" value="default" />
+  <button id="join">Войти в комнату</button>
+  <button id="call" disabled>Начать звонок</button>
+  <button id="hangup" disabled>Завершить</button>
+  <div id="status">Статус: не подключён</div>
+
+  <script>
+    let localStream;
+    let peerConnection;
+    let ws;
+    const roomInput = document.getElementById('room');
+    const joinBtn = document.getElementById('join');
+    const callBtn = document.getElementById('call');
+    const hangupBtn = document.getElementById('hangup');
+    const statusDiv = document.getElementById('status');
+
+    const configuration = {
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    };
+
+    joinBtn.onclick = async () => {
+      const room = roomInput.value.trim();
+      if (!room) return;
+
+      // Подключаемся к сигнальному серверу
+      ws = new WebSocket(`ws://${window.location.host}`);
+
+      ws.onopen = () => {
+        statusDiv.textContent = 'Подключён к серверу. Ожидание собеседника...';
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'offer') {
+          handleOffer(msg.payload);
+        } else if (msg.type === 'answer') {
+          peerConnection.setRemoteDescription(new RTCSessionDescription(msg.payload));
+        } else if (msg.type === 'ice-candidate') {
+          peerConnection.addIceCandidate(msg.payload);
+        }
+      };
+
+      // Получаем микрофон
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      callBtn.disabled = false;
+    };
+
+    callBtn.onclick = async () => {
+      peerConnection = new RTCPeerConnection(configuration);
+
+      localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          ws.send(JSON.stringify({
+            room: roomInput.value.trim(),
+            type: 'ice-candidate',
+            payload: event.candidate
+          }));
+        }
+      };
+
+      peerConnection.ontrack = (event) => {
+        const remoteAudio = document.getElementById('remoteAudio') || document.createElement('audio');
+        remoteAudio.id = 'remoteAudio';
+        remoteAudio.srcObject = event.streams[0];
+        remoteAudio.autoplay = true;
+        remoteAudio.controls = true;
+        if (!document.body.contains(remoteAudio)) {
+          document.body.appendChild(remoteAudio);
+        }
+      };
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+
+      ws.send(JSON.stringify({
+        room: roomInput.value.trim(),
+        type: 'offer',
+        payload: offer
+      }));
+
+      callBtn.disabled = true;
+      hangupBtn.disabled = false;
+      statusDiv.textContent = 'Звонок инициирован...';
+    };
+
+    hangupBtn.onclick = () => {
+      peerConnection.close();
+      peerConnection = null;
+      if (ws) ws.close();
+      const remoteAudio = document.getElementById('remoteAudio');
+      if (remoteAudio) remoteAudio.remove();
+      callBtn.disabled = false;
+      hangupBtn.disabled = true;
+      statusDiv.textContent = 'Звонок завершён';
+    };
+
+    // Ответ на offer
+    async function handleOffer(offer) {
+      peerConnection = new RTCPeerConnection(configuration);
+      localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          ws.send(JSON.stringify({
+            room: roomInput.value.trim(),
+            type: 'ice-candidate',
+            payload: event.candidate
+          }));
+        }
+      };
+
+      peerConnection.ontrack = (event) => {
+        const remoteAudio = document.getElementById('remoteAudio') || document.createElement('audio');
+        remoteAudio.id = 'remoteAudio';
+        remoteAudio.srcObject = event.streams[0];
+        remoteAudio.autoplay = true;
+        remoteAudio.controls = true;
+        if (!document.body.contains(remoteAudio)) {
+          document.body.appendChild(remoteAudio);
+        }
+      };
+
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+
+      ws.send(JSON.stringify({
+        room: roomInput.value.trim(),
+        type: 'answer',
+        payload: answer
+      }));
+
+      hangupBtn.disabled = false;
+      statusDiv.textContent = 'Соединение установлено!';
+    }
+  </script>
+</body>
+</html>
