@@ -2,148 +2,327 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>P2P Voice Chat</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Голосовой чат (Mesh)</title>
+  <!-- Picnic CSS — лёгкий фреймворк -->
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/picnic@7.1.3/picnic.min.css"
+  />
+  <style>
+    body {
+      padding: 2rem;
+      max-width: 800px;
+      margin: 0 auto;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 200px;
+      gap: 1.5rem;
+    }
+    @media (max-width: 600px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    #peers-list {
+      background: #f8f9fa;
+      border-radius: 0.3rem;
+      padding: 1rem;
+      height: fit-content;
+    }
+    .peer-item {
+      padding: 0.4rem 0;
+      font-size: 0.9rem;
+      border-bottom: 1px solid #eee;
+    }
+    .peer-item:last-child {
+      border-bottom: none;
+    }
+    .status {
+      margin-top: 1rem;
+      font-size: 0.9rem;
+      color: #555;
+    }
+    .hidden {
+      display: none;
+    }
+  </style>
 </head>
 <body>
-  <h1>P2P Голосовой чат</h1>
-  <input id="room" placeholder="Название комнаты" value="default" />
-  <button id="join">Войти в комнату</button>
-  <button id="call" disabled>Начать звонок</button>
-  <button id="hangup" disabled>Завершить</button>
-  <div id="status">Статус: не подключён</div>
+  <h1>🎤 Голосовой чат (до 5 человек)</h1>
+
+  <div class="grid">
+    <div>
+      <label>
+        Название комнаты
+        <input type="text" id="room" value="default" placeholder="room name" />
+      </label>
+      <br /><br />
+      <button id="join" class="primary">Войти</button>
+      <button id="leave" class="hidden">Покинуть</button>
+
+      <div class="status" id="status">Статус: не в сети</div>
+    </div>
+
+    <div id="peers-list">
+      <h3>Участники (<span id="peers-count">0</span>)</h3>
+      <div id="peers"></div>
+    </div>
+  </div>
 
   <script>
-    let localStream;
-    let peerConnection;
-    let ws;
     const roomInput = document.getElementById('room');
     const joinBtn = document.getElementById('join');
-    const callBtn = document.getElementById('call');
-    const hangupBtn = document.getElementById('hangup');
+    const leaveBtn = document.getElementById('leave');
     const statusDiv = document.getElementById('status');
+    const peersList = document.getElementById('peers');
+    const peersCount = document.getElementById('peers-count');
+
+    let selfId = null;
+    let localStream = null;
+    const peerConnections = new Map(); // remoteId → RTCPeerConnection
+    const peers = new Map(); // remoteId → name (для UI)
+    let ws = null;
 
     const configuration = {
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
     };
 
+    // Генерация короткого ID (например, "User-abc123")
+    function generateSelfId() {
+      const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+      let id = '';
+      for (let i = 0; i < 6; i++) {
+        id += chars[Math.floor(Math.random() * chars.length)];
+      }
+      return 'User-' + id;
+    }
+
+    // Обновление списка участников в UI
+    function updatePeersUI() {
+      peersList.innerHTML = '';
+      peersCount.textContent = peers.size;
+      for (const [id, name] of peers.entries()) {
+        const el = document.createElement('div');
+        el.className = 'peer-item';
+        el.textContent = name;
+        peersList.appendChild(el);
+      }
+    }
+
+    // Создание RTCPeerConnection с обработчиками
+    function createPeerConnection(remoteId) {
+      if (peerConnections.has(remoteId)) return;
+
+      const pc = new RTCPeerConnection(configuration);
+      peerConnections.set(remoteId, pc);
+
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          ws.send(JSON.stringify({
+            room: roomInput.value.trim(),
+            senderId: selfId,
+            targetId: remoteId,
+            type: 'ice-candidate',
+            payload: event.candidate
+          }));
+        }
+      };
+
+      pc.ontrack = (event) => {
+        const audioElId = `remoteAudio-${remoteId}`;
+        let audioEl = document.getElementById(audioElId);
+        if (!audioEl) {
+          audioEl = document.createElement('audio');
+          audioEl.id = audioElId;
+          audioEl.style.display = 'none';
+          audioEl.autoplay = true;
+          document.body.appendChild(audioEl);
+        }
+        audioEl.srcObject = event.streams[0];
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') {
+          cleanupPeer(remoteId);
+        }
+      };
+    }
+
+    // Удаление участника
+    function removePeer(remoteId) {
+      peers.delete(remoteId);
+      cleanupPeer(remoteId);
+      updatePeersUI();
+    }
+
+    // Закрытие соединения и очистка
+    function cleanupPeer(remoteId) {
+      const pc = peerConnections.get(remoteId);
+      if (pc) {
+        pc.close();
+        peerConnections.delete(remoteId);
+      }
+      const audioEl = document.getElementById(`remoteAudio-${remoteId}`);
+      if (audioEl) audioEl.remove();
+    }
+
+    // Отправка offer конкретному участнику
+    async function sendOffer(remoteId) {
+      const pc = peerConnections.get(remoteId);
+      if (!pc) return;
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({
+          room: roomInput.value.trim(),
+          senderId: selfId,
+          targetId: remoteId,
+          type: 'offer',
+          payload: offer
+        }));
+      } catch (e) {
+        console.error('Ошибка offer:', e);
+      }
+    }
+
+    // Обработка входящего offer
+    async function handleOffer(remoteId, offer) {
+      createPeerConnection(remoteId);
+      const pc = peerConnections.get(remoteId);
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({
+          room: roomInput.value.trim(),
+          senderId: selfId,
+          targetId: remoteId,
+          type: 'answer',
+          payload: answer
+        }));
+        peers.set(remoteId, remoteId);
+        updatePeersUI();
+      } catch (e) {
+        console.error('Ошибка ответа на offer:', e);
+      }
+    }
+
+    // Обработка answer
+    async function handleAnswer(remoteId, answer) {
+      const pc = peerConnections.get(remoteId);
+      if (pc) {
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          peers.set(remoteId, remoteId);
+          updatePeersUI();
+        } catch (e) {
+          console.error('Ошибка установки answer:', e);
+        }
+      }
+    }
+
+    // Обработка ICE-кандидата
+    function handleIceCandidate(remoteId, candidate) {
+      const pc = peerConnections.get(remoteId);
+      if (pc) {
+        pc.addIceCandidate(candidate);
+      }
+    }
+
+    // Вход в комнату
     joinBtn.onclick = async () => {
       const room = roomInput.value.trim();
       if (!room) return;
 
-      // ✅ Исправлено: автоматический выбор ws/wss
+      selfId = generateSelfId();
+      statusDiv.textContent = 'Получение микрофона...';
+
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        statusDiv.textContent = 'Ошибка: не удалось получить микрофон';
+        return;
+      }
+
       const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
       ws = new WebSocket(`${wsProtocol}${window.location.host}`);
 
       ws.onopen = () => {
-        statusDiv.textContent = 'Подключён к серверу. Ожидание собеседника...';
+        // Сообщаем, что зашли в комнату
+        ws.send(JSON.stringify({
+          room,
+          senderId: selfId,
+          type: 'join'
+        }));
+        statusDiv.textContent = `В комнате "${room}" как ${selfId}`;
+        joinBtn.classList.add('hidden');
+        leaveBtn.classList.remove('hidden');
       };
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'offer') {
-          handleOffer(msg.payload);
-        } else if (msg.type === 'answer') {
-          peerConnection.setRemoteDescription(new RTCSessionDescription(msg.payload));
-        } else if (msg.type === 'ice-candidate') {
-          peerConnection.addIceCandidate(msg.payload);
+        if (msg.senderId === selfId) return;
+
+        switch (msg.type) {
+          case 'join':
+            // Новый участник — устанавливаем соединение
+            createPeerConnection(msg.senderId);
+            sendOffer(msg.senderId);
+            break;
+
+          case 'leave':
+            removePeer(msg.senderId);
+            break;
+
+          case 'offer':
+            handleOffer(msg.senderId, msg.payload);
+            break;
+
+          case 'answer':
+            handleAnswer(msg.senderId, msg.payload);
+            break;
+
+          case 'ice-candidate':
+            handleIceCandidate(msg.senderId, msg.payload);
+            break;
         }
       };
 
-      // Получаем микрофон
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      callBtn.disabled = false;
+      ws.onclose = () => {
+        statusDiv.textContent = 'Соединение потеряно';
+        peers.clear();
+        peerConnections.forEach((pc, id) => pc.close());
+        peerConnections.clear();
+        document.querySelectorAll('audio[id^="remoteAudio-"]').forEach(el => el.remove());
+        updatePeersUI();
+      };
     };
 
-    callBtn.onclick = async () => {
-      peerConnection = new RTCPeerConnection(configuration);
-
-      localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
-
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-          ws.send(JSON.stringify({
-            room: roomInput.value.trim(),
-            type: 'ice-candidate',
-            payload: event.candidate
-          }));
-        }
-      };
-
-      peerConnection.ontrack = (event) => {
-        const remoteAudio = document.getElementById('remoteAudio') || document.createElement('audio');
-        remoteAudio.id = 'remoteAudio';
-        remoteAudio.srcObject = event.streams[0];
-        remoteAudio.autoplay = true;
-        remoteAudio.controls = true;
-        if (!document.body.contains(remoteAudio)) {
-          document.body.appendChild(remoteAudio);
-        }
-      };
-
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
-
-      ws.send(JSON.stringify({
-        room: roomInput.value.trim(),
-        type: 'offer',
-        payload: offer
-      }));
-
-      callBtn.disabled = true;
-      hangupBtn.disabled = false;
-      statusDiv.textContent = 'Звонок инициирован...';
+    // Выход из комнаты
+    leaveBtn.onclick = () => {
+      if (ws) {
+        ws.send(JSON.stringify({
+          room: roomInput.value.trim(),
+          senderId: selfId,
+          type: 'leave'
+        }));
+        ws.close();
+      }
+      joinBtn.classList.remove('hidden');
+      leaveBtn.classList.add('hidden');
+      statusDiv.textContent = 'Не в сети';
+      peers.clear();
+      peerConnections.forEach((pc, id) => pc.close());
+      peerConnections.clear();
+      document.querySelectorAll('audio[id^="remoteAudio-"]').forEach(el => el.remove());
+      updatePeersUI();
     };
-
-    hangupBtn.onclick = () => {
-      peerConnection?.close();
-      peerConnection = null;
-      if (ws) ws.close();
-      const remoteAudio = document.getElementById('remoteAudio');
-      if (remoteAudio) remoteAudio.remove();
-      callBtn.disabled = false;
-      hangupBtn.disabled = true;
-      statusDiv.textContent = 'Звонок завершён';
-    };
-
-    // Ответ на offer
-    async function handleOffer(offer) {
-      peerConnection = new RTCPeerConnection(configuration);
-      localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
-
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-          ws.send(JSON.stringify({
-            room: roomInput.value.trim(),
-            type: 'ice-candidate',
-            payload: event.candidate
-          }));
-        }
-      };
-
-      peerConnection.ontrack = (event) => {
-        const remoteAudio = document.getElementById('remoteAudio') || document.createElement('audio');
-        remoteAudio.id = 'remoteAudio';
-        remoteAudio.srcObject = event.streams[0];
-        remoteAudio.autoplay = true;
-        remoteAudio.controls = true;
-        if (!document.body.contains(remoteAudio)) {
-          document.body.appendChild(remoteAudio);
-        }
-      };
-
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-
-      ws.send(JSON.stringify({
-        room: roomInput.value.trim(),
-        type: 'answer',
-        payload: answer
-      }));
-
-      hangupBtn.disabled = false;
-      statusDiv.textContent = 'Соединение установлено!';
-    }
   </script>
 </body>
 </html>

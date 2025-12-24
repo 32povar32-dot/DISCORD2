@@ -2,7 +2,6 @@ const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 
-// HTTP-сервер для раздачи index.html
 const server = http.createServer((req, res) => {
   if (req.url === '/') {
     fs.readFile('index.html', (err, data) => {
@@ -17,25 +16,25 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// WebSocket-сервер
 const wss = new WebSocket.Server({ server });
 
-// Хранилище комнат: { roomName: [ws1, ws2, ...] }
 const rooms = {};
 
 wss.on('connection', (ws) => {
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
-      const { room, type, payload } = msg;
+      const { room, senderId } = msg;
 
-      if (!rooms[room]) rooms[room] = [];
-      if (!rooms[room].includes(ws)) rooms[room].push(ws);
+      if (!room || !senderId) return;
 
-      // Пересылаем сигнал всем в комнате, кроме отправителя
+      if (!rooms[room]) rooms[room] = new Set();
+      rooms[room].add(ws);
+
+      // Рассылаем ВСЕМ в комнате, включая отправителя (он сам отфильтрует)
       rooms[room].forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type, payload }));
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify(msg));
         }
       });
     } catch (e) {
@@ -44,15 +43,14 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    // Удаляем клиента из всех комнат
     for (const room in rooms) {
-      rooms[room] = rooms[room].filter(client => client !== ws);
-      if (rooms[room].length === 0) delete rooms[room];
+      rooms[room].delete(ws);
+      if (rooms[room].size === 0) delete rooms[room];
     }
   });
 });
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`Сервер запущен на http://localhost:${PORT}`);
+  console.log(`Сервер запущен на порту ${PORT}`);
 });
